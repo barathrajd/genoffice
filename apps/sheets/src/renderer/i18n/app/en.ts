@@ -1250,6 +1250,8 @@ export const en = {
   appOpenFileFirst: 'Open a file first',
   appNoPassword: 'No password',
   appProtectWorkbook: 'Protect Workbook',
+  appChangePassword: 'Change Password',
+  appWorkbookPasswordChanged: 'Workbook password updated.',
   appAllowEditRanges: 'Allow Edit Ranges',
   appGroupClipboard: 'Clipboard',
   appPaste: 'Paste',

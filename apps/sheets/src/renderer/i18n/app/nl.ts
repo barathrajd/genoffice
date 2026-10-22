@@ -1306,6 +1306,8 @@ export const nl = {
   appOpenFileFirst: 'Open eerst een bestand',
   appNoPassword: 'Geen wachtwoord',
   appProtectWorkbook: 'Werkmap beveiligen',
+  appChangePassword: 'Wachtwoord wijzigen',
+  appWorkbookPasswordChanged: 'Het wachtwoord van de werkmap is bijgewerkt.',
   appAllowEditRanges: 'Bewerken van bereiken toestaan',
   appGroupClipboard: 'Klembord',
   appPaste: 'Plakken',

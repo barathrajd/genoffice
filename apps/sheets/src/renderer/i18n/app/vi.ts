@@ -1262,6 +1262,8 @@ export const vi = {
   appOpenFileFirst: 'Mở một tệp trước',
   appNoPassword: 'Không có mật khẩu',
   appProtectWorkbook: 'Bảo vệ sổ làm việc',
+  appChangePassword: 'Đổi mật khẩu',
+  appWorkbookPasswordChanged: 'Đã cập nhật mật khẩu sổ làm việc.',
   appAllowEditRanges: 'Cho phép chỉnh sửa các vùng',
   appGroupClipboard: 'Bảng nhớ tạm',
   appPaste: 'Dán',

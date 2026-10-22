@@ -1310,6 +1310,8 @@ export const it = {
   appOpenFileFirst: 'Apri prima un file',
   appNoPassword: 'Nessuna password',
   appProtectWorkbook: 'Proteggi cartella di lavoro',
+  appChangePassword: 'Cambia password',
+  appWorkbookPasswordChanged: 'La password della cartella di lavoro è stata aggiornata.',
   appAllowEditRanges: 'Consenti modifica intervalli',
   appGroupClipboard: 'Appunti',
   appPaste: 'Incolla',

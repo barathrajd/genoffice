@@ -29,6 +29,8 @@ fn default_locale() -> String {
 pub enum Command {
     Open {
         path: PathBuf,
+        #[serde(default)]
+        password: Option<String>,
         #[serde(default = "default_locale")]
         locale: String,
         #[serde(default, rename = "shortDateFormat")]
@@ -96,6 +98,12 @@ pub enum Command {
         replacements: Vec<EntryContent>,
         removals: Vec<String>,
         additions: Vec<EntryContent>,
+    },
+    #[serde(rename_all = "camelCase")]
+    EncryptWorkbook {
+        source_path: PathBuf,
+        target_path: PathBuf,
+        password: String,
     },
     #[serde(rename_all = "camelCase")]
     RecalcCells {
@@ -509,6 +517,7 @@ pub fn handle_request(
     let result = match request.command {
         Command::Open {
             path,
+            password,
             locale,
             short_date_format,
         } => {
@@ -517,10 +526,11 @@ pub fn handle_request(
             // longer can.
             let in_flight_cancelled = in_flight.flag();
             sessions
-                .open_with_locale(
+                .open_with_password_locale(
                     &path,
                     &locale,
                     short_date_format.as_deref(),
+                    password.as_deref(),
                     &in_flight_cancelled,
                 )
                 .and_then(to_json_value)
@@ -614,6 +624,32 @@ pub fn handle_request(
                 &additions,
             )
             .and_then(to_json_value)
+        }
+        Command::EncryptWorkbook {
+            source_path,
+            target_path,
+            password,
+        } => {
+            let result = (|| {
+                let temporary =
+                    target_path.with_file_name(format!(".{}.encrypted.tmp", uuid::Uuid::new_v4()));
+                let source = std::fs::File::open(source_path)?;
+                let mut encrypted = std::fs::File::create(&temporary)?;
+                if let Err(error) =
+                    msoffice_crypto::encrypt_ooxml_to(source, &mut encrypted, &password)
+                {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(SidecarError::Workbook(error.to_string()));
+                }
+                encrypted.sync_all()?;
+                drop(encrypted);
+                if let Err(error) = std::fs::rename(&temporary, &target_path) {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(SidecarError::Io(error.to_string()));
+                }
+                Ok(serde_json::json!({ "ok": true }))
+            })();
+            result
         }
         Command::RecalcCells { path, edits, reads } => {
             return recalc.dispatch(request_id, path, edits, reads, output);

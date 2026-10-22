@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -130,7 +133,10 @@ struct CacheDirectory {
 
 impl CacheDirectory {
     fn create(path: PathBuf) -> Result<Self, SidecarError> {
-        fs::create_dir(&path)?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&path)?;
         Ok(Self {
             path,
             committed: false,
@@ -220,6 +226,16 @@ fn is_ole2_container(file: &mut File) -> std::io::Result<bool> {
     Ok(read == OLE2_MAGIC.len() && magic == OLE2_MAGIC)
 }
 
+struct TemporaryDecryptedFile(Option<PathBuf>);
+
+impl Drop for TemporaryDecryptedFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 impl WorkbookSessions {
     pub fn new() -> Self {
         Self {
@@ -250,20 +266,58 @@ impl WorkbookSessions {
         short_date_format: Option<&str>,
         cancelled: &AtomicBool,
     ) -> Result<WorkbookMetadata, SidecarError> {
+        self.open_with_password_locale(path, locale, short_date_format, None, cancelled)
+    }
+
+    pub fn open_with_password_locale(
+        &mut self,
+        path: &Path,
+        locale: &str,
+        short_date_format: Option<&str>,
+        password: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<WorkbookMetadata, SidecarError> {
         // Before any work: the host may have cancelled before this ran at all.
         if cancelled.load(Ordering::Acquire) {
             return Err(SidecarError::cancelled());
         }
         let canonical_path = canonicalize(path)?;
         let mut file = File::open(&canonical_path)?;
+        let mut decrypted_file = TemporaryDecryptedFile(None);
         if is_ole2_container(&mut file)? {
-            return Err(SidecarError::Workbook(
-                "This workbook is password-protected. GenOffice Sheets cannot open \
-                 encrypted workbooks yet."
-                    .into(),
-            ));
+            let password = password.ok_or_else(|| {
+                SidecarError::Workbook(
+                    "This workbook is password-protected. PASSWORD_REQUIRED".into(),
+                )
+            })?;
+            let path =
+                std::env::temp_dir().join(format!("genoffice-decrypted-{}.xlsx", Uuid::new_v4()));
+            let encrypted_file = File::open(&canonical_path)?;
+            let mut plaintext_options = OpenOptions::new();
+            plaintext_options.write(true).create_new(true);
+            #[cfg(unix)]
+            plaintext_options.mode(0o600);
+            let plaintext_file = plaintext_options.open(&path)?;
+            decrypted_file.0 = Some(path.clone());
+            msoffice_crypto::decrypt_ooxml_to(
+                encrypted_file,
+                plaintext_file,
+                password,
+                msoffice_crypto::IntegrityPolicy::default(),
+            )
+            .map_err(|_| {
+                SidecarError::Workbook(
+                    "Incorrect password or unsupported encrypted workbook.".into(),
+                )
+            })?;
+            file = File::open(path)?;
         }
         let mut archive = ZipArchive::new(file)?;
+        let workbook_path = decrypted_file
+            .0
+            .as_deref()
+            .unwrap_or(&canonical_path)
+            .to_path_buf();
         archive::validate_entries(&mut archive)?;
         // The archive is open and validated and nothing has been written to
         // disk yet, so abandoning here costs only the parse already done.
@@ -491,10 +545,11 @@ impl WorkbookSessions {
             .and_then(|value| value.to_str())
             .unwrap_or("workbook.xlsx")
             .to_owned();
+        let decrypted_path = decrypted_file.0.take();
         self.sessions.insert(
             session_id.clone(),
             WorkbookSession {
-                path: canonical_path,
+                path: workbook_path,
                 sheets: sheets.clone(),
                 runtimes,
                 shared_strings,
@@ -503,6 +558,7 @@ impl WorkbookSessions {
                 visuals: visual_objects.clone(),
                 cache_directory: cache_directory.path().to_path_buf(),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                decrypted_path: decrypted_path.clone(),
             },
         );
         // The session now owns the directory; Close reclaims it. Committing
@@ -511,6 +567,7 @@ impl WorkbookSessions {
         cache_directory.commit();
         Ok(WorkbookMetadata {
             session_id,
+            decrypted_path: decrypted_path.map(|path| path.to_string_lossy().into_owned()),
             name,
             entry_count,
             sheets,
@@ -675,6 +732,7 @@ struct WorkbookSession {
     visuals: Vec<VisualObject>,
     cache_directory: PathBuf,
     cancelled: Arc<AtomicBool>,
+    decrypted_path: Option<PathBuf>,
 }
 
 impl WorkbookSession {
@@ -955,9 +1013,15 @@ impl WorkbookSession {
                 let _ = handle.join();
             }
         }
-        if self.cache_directory.exists() {
-            fs::remove_dir_all(&self.cache_directory)?;
+        let cache_result = if self.cache_directory.exists() {
+            fs::remove_dir_all(&self.cache_directory)
+        } else {
+            Ok(())
+        };
+        if let Some(path) = self.decrypted_path.take() {
+            let _ = fs::remove_file(path);
         }
+        cache_result?;
         Ok(())
     }
 }

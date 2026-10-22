@@ -1271,6 +1271,8 @@ export const ms = {
   appOpenFileFirst: 'Buka fail dahulu',
   appNoPassword: 'Tiada kata laluan',
   appProtectWorkbook: 'Lindungi Buku Kerja',
+  appChangePassword: 'Tukar Kata Laluan',
+  appWorkbookPasswordChanged: 'Kata laluan buku kerja telah dikemas kini.',
   appAllowEditRanges: 'Benarkan Edit Julat',
   appGroupClipboard: 'Papan Klip',
   appPaste: 'Tampal',

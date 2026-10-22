@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { refreshCsvDigest } from './csv-digest'
 import { createServer } from 'node:http'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -39,6 +39,7 @@ import type {
 import { z } from 'zod'
 import {
   abortOnDestroyed,
+  atomicCopyFile,
   appMenuLabels,
   appMenuTemplate,
   buildPrintableHtml,
@@ -1647,6 +1648,9 @@ interface SessionInfo {
   /// overwrite of the file can never corrupt the save base — and Save As
   /// stays usable after one. Removed when the session closes.
   readonly snapshotPath: string
+  /// Present only for an Office-encrypted workbook; saves re-encrypt the
+  /// patched OOXML package with this password before replacing the source.
+  readonly password?: string
   /// Digest of the snapshot (== the file at open time).
   readonly sha256: string
   readonly sheetNames: ReadonlyMap<string, string>
@@ -2349,10 +2353,12 @@ function startCaptureServer(): void {
   server.listen(Number(debugPort) + 1, '127.0.0.1')
 }
 
-const sidecarOpenResultSchema = workbookFileSchema.omit({
-  sha256: true,
-  readOnly: true,
-})
+const sidecarOpenResultSchema = workbookFileSchema
+  .omit({
+    sha256: true,
+    readOnly: true,
+  })
+  .extend({ decryptedPath: z.string().optional() })
 
 export async function createSheetsWindow(
   options: { includeAiHandlers?: boolean } = {},
@@ -2851,7 +2857,11 @@ export function registerSheetsIpc(): void {
   /// (prepareWorkbookForOpen + openWorkbookSession + the opened hook) as a
   /// user-picked or shell-queued open, so a recovered workbook is a normal
   /// session rather than a merge source.
-  const openSelectedWorkbook = async (event: IpcMainInvokeEvent, explicitPath?: string) => {
+  const openSelectedWorkbook = async (
+    event: IpcMainInvokeEvent,
+    explicitPath?: string,
+    password?: string,
+  ) => {
     const entry = sessionFor(event)
     let path = explicitPath ?? queuedWorkbookPaths.get(event.sender.id) ?? forcedWorkbookPath
     // consume immediately (before the slow session open) so the shell's
@@ -2881,16 +2891,27 @@ export function registerSheetsIpc(): void {
       await discardPreparedOpen(prepared)
       return null
     }
-    const result = await openWorkbookSession(entry.client, prepared.openPath, entry.sessions, {
-      suggestSaveAs: prepared.suggestSaveAs,
-      csvImport: prepared.csvImport,
-      csvSourcePath: prepared.csvSourcePath,
-      emptyCsv: prepared.emptyCsv,
-      importTempDir: prepared.importTempDir,
-      restoreTarget: prepared.restoreTarget,
-      emptySource: prepared.emptySource,
-      unsavedNew: prepared.unsavedNew,
-    })
+    let result: WorkbookFile
+    try {
+      result = await openWorkbookSession(entry.client, prepared.openPath, entry.sessions, {
+        suggestSaveAs: prepared.suggestSaveAs,
+        csvImport: prepared.csvImport,
+        csvSourcePath: prepared.csvSourcePath,
+        emptyCsv: prepared.emptyCsv,
+        importTempDir: prepared.importTempDir,
+        restoreTarget: prepared.restoreTarget,
+        emptySource: prepared.emptySource,
+        unsavedNew: prepared.unsavedNew,
+        password,
+      })
+    } catch (error) {
+      await discardPreparedOpen(prepared)
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes('PASSWORD_REQUIRED') && password === undefined) {
+        return { passwordRequired: true as const, path }
+      }
+      throw error
+    }
     // The sidecar open itself can also outlive the tab after the pre-open
     // check. Close the newly registered session instead of stranding it in
     // the detached entry map.
@@ -2925,6 +2946,52 @@ export function registerSheetsIpc(): void {
     }
   })
 
+  ipcMain.handle(IPC_CHANNELS.openEncryptedWorkbook, async (event, input: unknown) => {
+    const { path, password } = z
+      .object({ path: z.string().min(1), password: z.string().min(1) })
+      .parse(input)
+    if (!existsSync(path)) throw new Error('Workbook file not found.')
+    return openSelectedWorkbook(event, path, password)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.updateWorkbookPassword, async (event, input: unknown) => {
+    const { sessionId, newPassword } = z
+      .object({
+        sessionId: z.string().uuid(),
+        newPassword: z.string().min(1).max(1024),
+      })
+      .strict()
+      .parse(input)
+    const entry = sessionFor(event)
+    const session = entry.sessions.get(sessionId)
+    if (!session) throw new Error('Unknown workbook session.')
+    if (session.password === undefined) {
+      throw new Error('This workbook is not protected by an open password.')
+    }
+
+    const currentSha = await sha256File(session.path).catch(() => undefined)
+    if (currentSha !== undefined && currentSha !== session.sha256) {
+      throw new Error(tm('errDiskChanged'))
+    }
+
+    const tempDir = await mkdtemp(join(app.getPath('temp'), 'genoffice-password-change-'))
+    const encryptedPath = join(tempDir, 'workbook.encrypted.xlsx')
+    try {
+      await entry.client.encryptWorkbook({
+        sourcePath: session.snapshotPath,
+        targetPath: encryptedPath,
+        password: newPassword,
+      })
+      await atomicCopyFile(encryptedPath, session.path)
+      const [sha256, fileStat] = await Promise.all([sha256File(session.path), stat(session.path)])
+      entry.sessions.set(sessionId, { ...session, password: newPassword, sha256 })
+      clearWorkbookRecovery(session.path)
+      return { sha256, fileBytes: fileStat.size, passwordProtected: true as const }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  })
+
   ipcMain.handle(IPC_CHANNELS.reopenWorkbook, async (event, path: unknown) => {
     const validated = z.string().min(1).parse(path)
     // A crash re-open targets the file the user already has open, so a
@@ -2933,7 +3000,10 @@ export function registerSheetsIpc(): void {
     if (!existsSync(validated)) throw new Error('Workbook file not found.')
     const ext = validated.slice(validated.lastIndexOf('.') + 1).toLowerCase()
     if (!WORKBOOK_EXTS.has(ext)) throw new Error(`Unsupported workbook: ${ext}`)
-    return openSelectedWorkbook(event, validated)
+    const priorSession = [...sessionFor(event).sessions.values()].find(
+      (session) => session.path === validated,
+    )
+    return openSelectedWorkbook(event, validated, priorSession?.password)
   })
 
   // Merge sources: same open pipeline as selectWorkbook, but multi-select,
@@ -3521,11 +3591,8 @@ export function registerSheetsIpc(): void {
       importTempDir: csvInPlace || quietUnsavedNew ? undefined : session.importTempDir,
       closeSidecar: () => client.close(request.sessionId),
     })
-    const file = await openWorkbookSession(
-      client,
-      targetPath,
-      entry.sessions,
-      csvInPlace
+    const file = await openWorkbookSession(client, targetPath, entry.sessions, {
+      ...(csvInPlace
         ? {
             csvImport: true,
             csvSourcePath: session.csvSourcePath,
@@ -3537,8 +3604,9 @@ export function registerSheetsIpc(): void {
               importTempDir: session.importTempDir,
               unsavedNew: true,
             }
-          : undefined,
-    )
+          : {}),
+      ...(session.password === undefined ? {} : { password: session.password }),
+    })
     if (quietUnsavedNew && session.suggestSaveAs !== undefined) {
       // the temp path must not reach the title or recents; the recovery copy
       // is what a crash restores from, so it tracks the saved bytes
@@ -4428,56 +4496,82 @@ async function writeWorkbookTo(
     sheetName,
     cells,
   }))
-  const mutation = await saveWorkbookViaSidecar({
-    client,
-    // The snapshot, not the live path: the save base must be the bytes this
-    // session's pending edits were made against, regardless of what other
-    // programs did to the file since.
-    sourcePath: session.snapshotPath,
-    targetPath,
-    edits,
-    bulkConstantFills,
-    structuralOps,
-    chartEdits: request.chartEdits,
-    // Located by package-absolute drawingPath, so no sheet-name mapping.
-    visualEdits: request.visualEdits,
-    sheetPlan,
-    filterStates,
-    hyperlinkEdits,
-    cfStates,
-    dvStates,
-    sheetProtections,
-    tabColorStates,
-    definedNamesState: request.definedNamesState,
-    themeState: request.themeState,
-    workbookProtectionState: request.workbookProtectionState,
-    protectedRangeStates,
-    visualAdditions,
-    cellImageAdditions,
-    pageSetupStates,
-    noteStates,
-    tableAdditions,
-    tableEdits,
-    pivotAdditions,
-    sparklineAdditions,
-    formulaValues,
-    pivotCacheRefreshPaths: request.pivotCacheRefreshPaths,
-    // Output-area expansion from layout growth: sheetId → sheet name; the part
-    // path is resolved by the gateway.
-    pivotRefreshUpdates: request.pivotRefreshUpdates.map((update) => ({
-      cachePath: update.cachePath,
-      sheetName: resolveSheetName(update.sheetId),
-      newOutputRef: update.newOutputRef,
-      ...(update.relayout === undefined
-        ? {}
-        : {
-            relayout: (({ sheetId: _sheetId, sourceSheetId, ...rest }) => ({
-              ...rest,
-              sourceSheetName: resolveSheetName(sourceSheetId),
-            }))(update.relayout),
-          }),
-    })),
-  })
+  const encryptedSaveTempDir = session.password
+    ? await mkdtemp(join(app.getPath('temp'), 'genoffice-encrypted-save-'))
+    : undefined
+  const plainTargetPath = encryptedSaveTempDir
+    ? join(encryptedSaveTempDir, 'workbook.xlsx')
+    : targetPath
+  let mutation: Awaited<ReturnType<typeof saveWorkbookViaSidecar>>
+  try {
+    mutation = await saveWorkbookViaSidecar({
+      client,
+      // The snapshot, not the live path: the save base must be the bytes this
+      // session's pending edits were made against, regardless of what other
+      // programs did to the file since.
+      sourcePath: session.snapshotPath,
+      targetPath: plainTargetPath,
+      edits,
+      bulkConstantFills,
+      structuralOps,
+      chartEdits: request.chartEdits,
+      // Located by package-absolute drawingPath, so no sheet-name mapping.
+      visualEdits: request.visualEdits,
+      sheetPlan,
+      filterStates,
+      hyperlinkEdits,
+      cfStates,
+      dvStates,
+      sheetProtections,
+      tabColorStates,
+      definedNamesState: request.definedNamesState,
+      themeState: request.themeState,
+      workbookProtectionState: request.workbookProtectionState,
+      protectedRangeStates,
+      visualAdditions,
+      cellImageAdditions,
+      pageSetupStates,
+      noteStates,
+      tableAdditions,
+      tableEdits,
+      pivotAdditions,
+      sparklineAdditions,
+      formulaValues,
+      pivotCacheRefreshPaths: request.pivotCacheRefreshPaths,
+      // Output-area expansion from layout growth: sheetId → sheet name; the part
+      // path is resolved by the gateway.
+      pivotRefreshUpdates: request.pivotRefreshUpdates.map((update) => ({
+        cachePath: update.cachePath,
+        sheetName: resolveSheetName(update.sheetId),
+        newOutputRef: update.newOutputRef,
+        ...(update.relayout === undefined
+          ? {}
+          : {
+              relayout: (({ sheetId: _sheetId, sourceSheetId, ...rest }) => ({
+                ...rest,
+                sourceSheetName: resolveSheetName(sourceSheetId),
+              }))(update.relayout),
+            }),
+      })),
+    })
+    if (session.password) {
+      const encryptedTargetPath = `${targetPath}.${randomUUID()}.encrypted.tmp`
+      await client.encryptWorkbook({
+        sourcePath: plainTargetPath,
+        targetPath: encryptedTargetPath,
+        password: session.password,
+      })
+      try {
+        await atomicCopyFile(encryptedTargetPath, targetPath)
+      } finally {
+        await rm(encryptedTargetPath, { force: true }).catch(() => undefined)
+      }
+    }
+  } finally {
+    if (encryptedSaveTempDir) {
+      await rm(encryptedSaveTempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
   return mutation
 }
 
@@ -4526,6 +4620,7 @@ async function openWorkbookSession(
     restoreTarget?: string | undefined
     emptySource?: boolean | undefined
     unsavedNew?: boolean | undefined
+    password?: string | undefined
   },
 ): Promise<WorkbookFile> {
   const {
@@ -4537,6 +4632,7 @@ async function openWorkbookSession(
     restoreTarget,
     emptySource,
     unsavedNew,
+    password,
   } = options ?? {}
   // Snapshot first, then the sidecar opens the snapshot (not the live path):
   // everything the session serves — cell reads, media, recalc, saves — comes
@@ -4544,10 +4640,8 @@ async function openWorkbookSession(
   // copy. The digest also describes exactly those bytes.
   const snapshotPath = await snapshotWorkbook(path)
   try {
-    const [opened, digest, snapshotStat, restoreTargetSha, csvSourceSha] = await Promise.all([
-      client
-        .open(snapshotPath, getUiLang(), systemShortDate())
-        .then((result) => sidecarOpenResultSchema.parse(result)),
+    const [rawOpened, digest, snapshotStat, restoreTargetSha, csvSourceSha] = await Promise.all([
+      client.open(snapshotPath, getUiLang(), systemShortDate(), password),
       sha256File(snapshotPath),
       stat(snapshotPath),
       // Missing original (deleted since the crash) is fine: the write-back recreates it.
@@ -4558,12 +4652,16 @@ async function openWorkbookSession(
         ? Promise.resolve(undefined)
         : sha256File(csvSourcePath).catch(() => undefined),
     ])
+    const { decryptedPath, ...opened } = sidecarOpenResultSchema.parse(rawOpened)
+    const sessionSnapshotPath = decryptedPath ?? snapshotPath
+    if (sessionSnapshotPath !== snapshotPath) await rm(snapshotPath, { force: true })
     sessions.set(opened.sessionId, {
       path,
-      snapshotPath,
+      snapshotPath: sessionSnapshotPath,
       sha256: digest,
       sheetNames: new Map(opened.sheets.map((sheet) => [sheet.id, sheet.name])),
       automaticRecoveryDisabled: !allowsAutomaticWorkbookRecovery(opened.sheets),
+      ...(password === undefined ? {} : { password }),
       ...(suggestSaveAs === undefined ? {} : { suggestSaveAs }),
       ...(csvImport ? { csvImport } : {}),
       ...(csvSourcePath === undefined ? {} : { csvSourcePath }),
@@ -4584,6 +4682,7 @@ async function openWorkbookSession(
       fileBytes: snapshotStat.size,
       readOnly: false,
       needsSaveAs: suggestSaveAs !== undefined,
+      passwordProtected: password !== undefined,
       ...(unsavedNew ? { unsavedNew: true } : {}),
       ...(csvSourcePath === undefined ? {} : { csvPath: csvSourcePath }),
       ...(emptyCsv ? { emptyCsv: true } : {}),

@@ -71,6 +71,72 @@ describe('XLSX Rust sidecar', () => {
     }
   })
 
+  it('rotates an encrypted workbook password and preserves its worksheet data', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'xlsx-password-rotation-test-'))
+    const sourcePath = join(directory, 'source.xlsx')
+    const firstEncryptedPath = join(directory, 'first-password.xlsx')
+    const rotatedPath = join(directory, 'rotated-password.xlsx')
+    await writeFile(sourcePath, await buildCompatibilityFixture())
+    const client = new XlsxSidecarClient(sidecarBinaryPath())
+    let sessionId: string | null = null
+    try {
+      await client.encryptWorkbook({
+        sourcePath,
+        targetPath: firstEncryptedPath,
+        password: 'first-password',
+      })
+      await expect(client.open(firstEncryptedPath)).rejects.toThrow('PASSWORD_REQUIRED')
+      await expect(
+        client.open(firstEncryptedPath, 'en', undefined, 'incorrect-password'),
+      ).rejects.toThrow(/Incorrect password/)
+
+      const decryptedWorkbook = (await client.open(
+        firstEncryptedPath,
+        'en',
+        undefined,
+        'first-password',
+      )) as { sessionId: string; decryptedPath?: string }
+      sessionId = decryptedWorkbook.sessionId
+      expect(decryptedWorkbook.decryptedPath).toBeTruthy()
+
+      await client.encryptWorkbook({
+        sourcePath: decryptedWorkbook.decryptedPath!,
+        targetPath: rotatedPath,
+        password: 'updated-password',
+      })
+      await client.close(sessionId)
+      sessionId = null
+      await expect(client.open(rotatedPath, 'en', undefined, 'first-password')).rejects.toThrow(
+        /Incorrect password/,
+      )
+
+      const opened = openResultSchema.parse(
+        await client.open(rotatedPath, 'en', undefined, 'updated-password'),
+      )
+      sessionId = opened.sessionId
+      const result = workbookRangeResultSchema.parse(
+        await client.readRange({
+          sessionId,
+          sheetId: 'sheet-1',
+          range: {
+            startRow: 0,
+            endRow: 0,
+            startColumn: 0,
+            endColumn: 1,
+          },
+        }),
+      )
+      expect(result.cells).toEqual([
+        { row: 0, column: 0, value: 'Old', styleIndex: 0 },
+        { row: 0, column: 1, value: 10, styleIndex: 0 },
+      ])
+    } finally {
+      if (sessionId) await client.close(sessionId)
+      client.stop()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('skips a queued request whose out-of-band cancel arrived first', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'xlsx-cancel-test-'))
     const path = join(directory, 'fixture.xlsx')

@@ -64,10 +64,16 @@ export class XlsxSidecarClient {
     for (const listener of this.exitListeners) listener()
   }
 
-  async open(path: string, locale = 'zh', shortDateFormat?: string): Promise<unknown> {
+  async open(
+    path: string,
+    locale = 'zh',
+    shortDateFormat?: string,
+    password?: string,
+  ): Promise<unknown> {
     return this.request({
       command: 'open',
       path,
+      ...(password === undefined ? {} : { password }),
       locale,
       ...(shortDateFormat === undefined ? {} : { shortDateFormat }),
     })
@@ -156,6 +162,14 @@ export class XlsxSidecarClient {
     readonly additions: readonly { name: string; contentPath: string }[]
   }): Promise<unknown> {
     return this.request({ command: 'save_archive', ...input }, ARCHIVE_TIMEOUT_MS)
+  }
+
+  async encryptWorkbook(input: {
+    readonly sourcePath: string
+    readonly targetPath: string
+    readonly password: string
+  }): Promise<unknown> {
+    return this.request({ command: 'encrypt_workbook', ...input }, ARCHIVE_TIMEOUT_MS)
   }
 
   /** IronCalc-backed recalculation: load the file, apply the pending edits,

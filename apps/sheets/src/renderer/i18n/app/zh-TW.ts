@@ -1183,6 +1183,8 @@ export const zhTW = {
   appOpenFileFirst: '請先開啟檔案',
   appNoPassword: '無密碼',
   appProtectWorkbook: '保護活頁簿',
+  appChangePassword: '變更密碼',
+  appWorkbookPasswordChanged: '活頁簿密碼已更新。',
   appAllowEditRanges: '允許編輯範圍',
   appGroupClipboard: '剪貼簿',
   appPaste: '貼上',

@@ -1313,6 +1313,8 @@ export const es = {
   appOpenFileFirst: 'Abra primero un archivo',
   appNoPassword: 'Sin contraseña',
   appProtectWorkbook: 'Proteger libro',
+  appChangePassword: 'Cambiar contraseña',
+  appWorkbookPasswordChanged: 'Se actualizó la contraseña del libro.',
   appAllowEditRanges: 'Permitir editar rangos',
   appGroupClipboard: 'Portapapeles',
   appPaste: 'Pegar',

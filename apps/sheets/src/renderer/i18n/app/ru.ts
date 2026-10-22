@@ -1290,6 +1290,8 @@ export const ru = {
   appOpenFileFirst: 'Сначала откройте файл',
   appNoPassword: 'Без пароля',
   appProtectWorkbook: 'Защитить книгу',
+  appChangePassword: 'Изменить пароль',
+  appWorkbookPasswordChanged: 'Пароль книги обновлён.',
   appAllowEditRanges: 'Разрешить изменение диапазонов',
   appGroupClipboard: 'Буфер обмена',
   appPaste: 'Вставить',

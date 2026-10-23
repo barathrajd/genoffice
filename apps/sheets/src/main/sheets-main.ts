@@ -118,6 +118,7 @@ import {
 } from '@genoffice/xlsx-gateway/gateway/xlsx-package-io'
 import { parsePivotDefinition } from '@genoffice/xlsx-gateway/gateway/xlsx-pivot'
 import type { SheetEditPlan } from '@genoffice/xlsx-gateway/gateway/xlsx-sheets'
+import { readWorkbookRedactionPart } from './workbook-redactions'
 import type {
   AttachmentAddResult,
   AttachmentImageResult,
@@ -141,6 +142,8 @@ import {
   workbookMediaRequestSchema,
   workbookMediaResultSchema,
   workbookPivotRequestSchema,
+  workbookRedactionsRequestSchema,
+  workbookRedactionsResultSchema,
   localImageRequestSchema,
   localImageResultSchema,
   screenCaptureRequestSchema,
@@ -3314,6 +3317,18 @@ export function registerSheetsIpc(): void {
     return workbookPivotDefinitionSchema.parse(parsePivotDefinition(pivotXml, cacheXml))
   })
 
+  ipcMain.handle(IPC_CHANNELS.readWorkbookRedactions, async (event, input: unknown) => {
+    const entry = sessionFor(event)
+    const request = workbookRedactionsRequestSchema.parse(input)
+    const session = entry.sessions.get(request.sessionId)
+    if (!session) throw new Error('Unknown workbook session.')
+    // A damaged part answers `unreadable` rather than an empty list: reporting
+    // "nothing is withheld" would hand the model the values it holds.
+    return workbookRedactionsResultSchema.parse(
+      await readWorkbookRedactionPart(entry.client, session.snapshotPath),
+    )
+  })
+
   ipcMain.handle(IPC_CHANNELS.exportPdf, async (event, input: unknown) => {
     sessionFor(event)
     const request = workbookExportPdfRequestSchema.parse(input)
@@ -4487,6 +4502,18 @@ async function writeWorkbookTo(
     sheetName,
     cells,
   }))
+  // Preserve redaction marks across this save, including optional fill data.
+  const redactionStates = request.redactionStates.map((state) => ({
+    sheetName: state.sheetName,
+    marks: state.marks.map((mark) => ({
+      startRow: mark.startRow,
+      endRow: mark.endRow,
+      startColumn: mark.startColumn,
+      endColumn: mark.endColumn,
+      label: mark.label,
+      ...('previousFill' in mark ? { previousFill: mark.previousFill ?? null } : {}),
+    })),
+  }))
   const encryptedSaveTempDir = session.password
     ? await mkdtemp(join(app.getPath('temp'), 'genoffice-encrypted-save-'))
     : undefined
@@ -4544,6 +4571,7 @@ async function writeWorkbookTo(
               }))(update.relayout),
             }),
       })),
+      redactionStates,
     })
     if (session.password) {
       const encryptedBytes = encryptOoxml(await readFile(plainTargetPath), session.password)

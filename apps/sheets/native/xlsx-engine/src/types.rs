@@ -8,10 +8,6 @@ use super::*;
 #[serde(rename_all = "camelCase")]
 pub struct WorkbookMetadata {
     pub session_id: String,
-    /// Temporary plaintext OOXML package created while opening an encrypted workbook.
-    /// The host uses it as the session snapshot for archive edits and removes it on close.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decrypted_path: Option<String>,
     pub name: String,
     pub entry_count: usize,
     pub sheets: Vec<SheetMetadata>,

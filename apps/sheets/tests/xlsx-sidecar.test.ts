@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import JSZip from 'jszip'
 import { z } from 'zod'
 
+import { decryptOoxml, encryptOoxml, isEncryptedOoxml } from '@genoffice/electron-utils'
 import { blankXlsxBuffer } from '@genoffice/xlsx-gateway/gateway/csv-import'
 import { saveWorkbookViaSidecar } from '@genoffice/xlsx-gateway/gateway/xlsx-package-io'
 import { XlsxSidecarClient } from '../src/main/xlsx-sidecar-client'
@@ -71,48 +72,27 @@ describe('XLSX Rust sidecar', () => {
     }
   })
 
-  it('rotates an encrypted workbook password and preserves its worksheet data', async () => {
+  it('rejects encrypted OOXML and preserves workbook data through host-side password rotation', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'xlsx-password-rotation-test-'))
-    const sourcePath = join(directory, 'source.xlsx')
     const firstEncryptedPath = join(directory, 'first-password.xlsx')
-    const rotatedPath = join(directory, 'rotated-password.xlsx')
-    await writeFile(sourcePath, await buildCompatibilityFixture())
+    const decryptedSnapshotPath = join(directory, 'decrypted-snapshot.xlsx')
+    const updatedEncryptedPath = join(directory, 'updated-password.xlsx')
+    const plainBytes = Buffer.from(await buildCompatibilityFixture())
+    const encryptedBytes = encryptOoxml(plainBytes, 'first-password')
+    expect(isEncryptedOoxml(encryptedBytes)).toBe(true)
+    await writeFile(firstEncryptedPath, encryptedBytes)
     const client = new XlsxSidecarClient(sidecarBinaryPath())
     let sessionId: string | null = null
     try {
-      await client.encryptWorkbook({
-        sourcePath,
-        targetPath: firstEncryptedPath,
-        password: 'first-password',
-      })
-      await expect(client.open(firstEncryptedPath)).rejects.toThrow('PASSWORD_REQUIRED')
-      await expect(
-        client.open(firstEncryptedPath, 'en', undefined, 'incorrect-password'),
-      ).rejects.toThrow(/Incorrect password/)
-
-      const decryptedWorkbook = (await client.open(
-        firstEncryptedPath,
-        'en',
-        undefined,
-        'first-password',
-      )) as { sessionId: string; decryptedPath?: string }
-      sessionId = decryptedWorkbook.sessionId
-      expect(decryptedWorkbook.decryptedPath).toBeTruthy()
-
-      await client.encryptWorkbook({
-        sourcePath: decryptedWorkbook.decryptedPath!,
-        targetPath: rotatedPath,
-        password: 'updated-password',
-      })
-      await client.close(sessionId)
-      sessionId = null
-      await expect(client.open(rotatedPath, 'en', undefined, 'first-password')).rejects.toThrow(
-        /Incorrect password/,
+      await expect(client.open(firstEncryptedPath)).rejects.toThrow(/password-protected/)
+      const decryptedBytes = await decryptOoxml(encryptedBytes, 'first-password')
+      expect(isEncryptedOoxml(decryptedBytes)).toBe(false)
+      await expect(decryptOoxml(encryptedBytes, 'incorrect-password')).rejects.toThrow(
+        /password is incorrect/i,
       )
 
-      const opened = openResultSchema.parse(
-        await client.open(rotatedPath, 'en', undefined, 'updated-password'),
-      )
+      await writeFile(decryptedSnapshotPath, decryptedBytes)
+      const opened = openResultSchema.parse(await client.open(decryptedSnapshotPath))
       sessionId = opened.sessionId
       const result = workbookRangeResultSchema.parse(
         await client.readRange({
@@ -130,6 +110,14 @@ describe('XLSX Rust sidecar', () => {
         { row: 0, column: 0, value: 'Old', styleIndex: 0 },
         { row: 0, column: 1, value: 10, styleIndex: 0 },
       ])
+
+      const updatedEncryptedBytes = encryptOoxml(decryptedBytes, 'updated-password')
+      await writeFile(updatedEncryptedPath, updatedEncryptedBytes)
+      const reopenedBytes = await readFile(updatedEncryptedPath)
+      await expect(decryptOoxml(reopenedBytes, 'first-password')).rejects.toThrow(
+        /password is incorrect/i,
+      )
+      expect(await decryptOoxml(reopenedBytes, 'updated-password')).toEqual(decryptedBytes)
     } finally {
       if (sessionId) await client.close(sessionId)
       client.stop()

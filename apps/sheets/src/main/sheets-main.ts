@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { refreshCsvDigest } from './csv-digest'
 import { createServer } from 'node:http'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -39,7 +39,9 @@ import type {
 import { z } from 'zod'
 import {
   abortOnDestroyed,
-  atomicCopyFile,
+  decryptOoxml,
+  encryptOoxml,
+  isEncryptedOoxml,
   appMenuLabels,
   appMenuTemplate,
   buildPrintableHtml,
@@ -116,6 +118,7 @@ import {
 } from '@genoffice/xlsx-gateway/gateway/xlsx-package-io'
 import { parsePivotDefinition } from '@genoffice/xlsx-gateway/gateway/xlsx-pivot'
 import type { SheetEditPlan } from '@genoffice/xlsx-gateway/gateway/xlsx-sheets'
+import { readWorkbookRedactionPart } from './workbook-redactions'
 import type {
   AttachmentAddResult,
   AttachmentImageResult,
@@ -139,6 +142,8 @@ import {
   workbookMediaRequestSchema,
   workbookMediaResultSchema,
   workbookPivotRequestSchema,
+  workbookRedactionsRequestSchema,
+  workbookRedactionsResultSchema,
   localImageRequestSchema,
   localImageResultSchema,
   screenCaptureRequestSchema,
@@ -2353,16 +2358,15 @@ function startCaptureServer(): void {
   server.listen(Number(debugPort) + 1, '127.0.0.1')
 }
 
-const sidecarOpenResultSchema = workbookFileSchema
-  .omit({
-    sha256: true,
-    readOnly: true,
-  })
-  .extend({ decryptedPath: z.string().optional() })
+const sidecarOpenResultSchema = workbookFileSchema.omit({
+  sha256: true,
+  readOnly: true,
+})
 
 export async function createSheetsWindow(
   options: { includeAiHandlers?: boolean } = {},
 ): Promise<BrowserWindow> {
+  await getSessionSnapshotDirectory()
   const client = sidecar ?? new XlsxSidecarClient(resolveSidecarPath())
   sidecar = client
   client.start()
@@ -2974,22 +2978,12 @@ export function registerSheetsIpc(): void {
       throw new Error(tm('errDiskChanged'))
     }
 
-    const tempDir = await mkdtemp(join(app.getPath('temp'), 'genoffice-password-change-'))
-    const encryptedPath = join(tempDir, 'workbook.encrypted.xlsx')
-    try {
-      await entry.client.encryptWorkbook({
-        sourcePath: session.snapshotPath,
-        targetPath: encryptedPath,
-        password: newPassword,
-      })
-      await atomicCopyFile(encryptedPath, session.path)
-      const [sha256, fileStat] = await Promise.all([sha256File(session.path), stat(session.path)])
-      entry.sessions.set(sessionId, { ...session, password: newPassword, sha256 })
-      clearWorkbookRecovery(session.path)
-      return { sha256, fileBytes: fileStat.size, passwordProtected: true as const }
-    } finally {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
-    }
+    const encryptedBytes = encryptOoxml(await readFile(session.snapshotPath), newPassword)
+    await atomicWriteFile(session.path, encryptedBytes)
+    const sha256 = createHash('sha256').update(encryptedBytes).digest('hex')
+    entry.sessions.set(sessionId, { ...session, password: newPassword, sha256 })
+    clearWorkbookRecovery(session.path)
+    return { sha256, fileBytes: encryptedBytes.byteLength, passwordProtected: true as const }
   })
 
   ipcMain.handle(IPC_CHANNELS.reopenWorkbook, async (event, path: unknown) => {
@@ -3321,6 +3315,18 @@ export function registerSheetsIpc(): void {
       readArchiveEntryText(entry.client, session.snapshotPath, request.cachePath),
     ])
     return workbookPivotDefinitionSchema.parse(parsePivotDefinition(pivotXml, cacheXml))
+  })
+
+  ipcMain.handle(IPC_CHANNELS.readWorkbookRedactions, async (event, input: unknown) => {
+    const entry = sessionFor(event)
+    const request = workbookRedactionsRequestSchema.parse(input)
+    const session = entry.sessions.get(request.sessionId)
+    if (!session) throw new Error('Unknown workbook session.')
+    // A damaged part answers `unreadable` rather than an empty list: reporting
+    // "nothing is withheld" would hand the model the values it holds.
+    return workbookRedactionsResultSchema.parse(
+      await readWorkbookRedactionPart(entry.client, session.snapshotPath),
+    )
   })
 
   ipcMain.handle(IPC_CHANNELS.exportPdf, async (event, input: unknown) => {
@@ -4496,6 +4502,18 @@ async function writeWorkbookTo(
     sheetName,
     cells,
   }))
+  // Preserve redaction marks across this save, including optional fill data.
+  const redactionStates = request.redactionStates.map((state) => ({
+    sheetName: state.sheetName,
+    marks: state.marks.map((mark) => ({
+      startRow: mark.startRow,
+      endRow: mark.endRow,
+      startColumn: mark.startColumn,
+      endColumn: mark.endColumn,
+      label: mark.label,
+      ...('previousFill' in mark ? { previousFill: mark.previousFill ?? null } : {}),
+    })),
+  }))
   const encryptedSaveTempDir = session.password
     ? await mkdtemp(join(app.getPath('temp'), 'genoffice-encrypted-save-'))
     : undefined
@@ -4553,19 +4571,11 @@ async function writeWorkbookTo(
               }))(update.relayout),
             }),
       })),
+      redactionStates,
     })
     if (session.password) {
-      const encryptedTargetPath = `${targetPath}.${randomUUID()}.encrypted.tmp`
-      await client.encryptWorkbook({
-        sourcePath: plainTargetPath,
-        targetPath: encryptedTargetPath,
-        password: session.password,
-      })
-      try {
-        await atomicCopyFile(encryptedTargetPath, targetPath)
-      } finally {
-        await rm(encryptedTargetPath, { force: true }).catch(() => undefined)
-      }
+      const encryptedBytes = encryptOoxml(await readFile(plainTargetPath), session.password)
+      await atomicWriteFile(targetPath, encryptedBytes)
     }
   } finally {
     if (encryptedSaveTempDir) {
@@ -4575,13 +4585,53 @@ async function writeWorkbookTo(
   return mutation
 }
 
-/** Copies the workbook into the temp snapshot dir; the copy is the session's
+let sessionSnapshotDirectoryPromise: Promise<string> | undefined
+
+/** Create a private per-process snapshot directory and sweep abandoned sessions. */
+async function createSessionSnapshotDirectory(): Promise<string> {
+  const root = join(app.getPath('temp'), 'genoffice-sheets-sessions')
+  await mkdir(root, { recursive: true, mode: 0o700 })
+  const directory = join(root, `${process.pid}-${randomUUID()}`)
+  await mkdir(directory, { mode: 0o700 })
+
+  const previousDirectories = await readdir(root, { withFileTypes: true })
+  await Promise.all(
+    previousDirectories.map(async (entry) => {
+      if (!entry.isDirectory() || entry.name === directory.slice(root.length + 1)) return
+      const match = /^(\d+)-/.exec(entry.name)
+      if (!match) return
+      const pid = Number(match[1])
+      if (pid !== process.pid) {
+        try {
+          process.kill(pid, 0)
+          return
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return
+        }
+      }
+      await rm(join(root, entry.name), { recursive: true, force: true }).catch(() => undefined)
+    }),
+  )
+  return directory
+}
+
+async function getSessionSnapshotDirectory(): Promise<string> {
+  if (!sessionSnapshotDirectoryPromise) {
+    sessionSnapshotDirectoryPromise = createSessionSnapshotDirectory().catch((error: unknown) => {
+      sessionSnapshotDirectoryPromise = undefined
+      throw error
+    })
+  }
+  return sessionSnapshotDirectoryPromise
+}
+
+/** Snapshot bytes in a private temporary directory; this is the session's
  * save base (see SessionInfo.snapshotPath). */
-async function snapshotWorkbook(path: string): Promise<string> {
-  const dir = join(app.getPath('temp'), 'genoffice-sheets-sessions')
-  await mkdir(dir, { recursive: true })
+async function snapshotWorkbook(path: string, bytes?: Buffer): Promise<string> {
+  const dir = await getSessionSnapshotDirectory()
   const snapshotPath = join(dir, `${randomUUID()}.xlsx`)
-  await copyFile(path, snapshotPath)
+  if (bytes) await writeFile(snapshotPath, bytes, { mode: 0o600 })
+  else await copyFile(path, snapshotPath)
   return snapshotPath
 }
 
@@ -4634,16 +4684,20 @@ async function openWorkbookSession(
     unsavedNew,
     password,
   } = options ?? {}
+  const sourceBytes = await readFile(path)
+  const encrypted = isEncryptedOoxml(sourceBytes)
+  if (encrypted && password === undefined) {
+    throw new Error('This workbook is password-protected. PASSWORD_REQUIRED')
+  }
+  const snapshotBytes = encrypted ? await decryptOoxml(sourceBytes, password!) : undefined
   // Snapshot first, then the sidecar opens the snapshot (not the live path):
   // everything the session serves — cell reads, media, recalc, saves — comes
   // from the same bytes, even if the file on disk changes right after the
   // copy. The digest also describes exactly those bytes.
-  const snapshotPath = await snapshotWorkbook(path)
+  const snapshotPath = await snapshotWorkbook(path, snapshotBytes)
   try {
-    const [rawOpened, digest, snapshotStat, restoreTargetSha, csvSourceSha] = await Promise.all([
-      client.open(snapshotPath, getUiLang(), systemShortDate(), password),
-      sha256File(snapshotPath),
-      stat(snapshotPath),
+    const [rawOpened, restoreTargetSha, csvSourceSha] = await Promise.all([
+      client.open(snapshotPath, getUiLang(), systemShortDate()),
       // Missing original (deleted since the crash) is fine: the write-back recreates it.
       restoreTarget === undefined
         ? Promise.resolve(undefined)
@@ -4652,16 +4706,15 @@ async function openWorkbookSession(
         ? Promise.resolve(undefined)
         : sha256File(csvSourcePath).catch(() => undefined),
     ])
-    const { decryptedPath, ...opened } = sidecarOpenResultSchema.parse(rawOpened)
-    const sessionSnapshotPath = decryptedPath ?? snapshotPath
-    if (sessionSnapshotPath !== snapshotPath) await rm(snapshotPath, { force: true })
+    const opened = sidecarOpenResultSchema.parse(rawOpened)
+    const digest = createHash('sha256').update(sourceBytes).digest('hex')
     sessions.set(opened.sessionId, {
       path,
-      snapshotPath: sessionSnapshotPath,
+      snapshotPath,
       sha256: digest,
       sheetNames: new Map(opened.sheets.map((sheet) => [sheet.id, sheet.name])),
       automaticRecoveryDisabled: !allowsAutomaticWorkbookRecovery(opened.sheets),
-      ...(password === undefined ? {} : { password }),
+      ...(encrypted ? { password: password! } : {}),
       ...(suggestSaveAs === undefined ? {} : { suggestSaveAs }),
       ...(csvImport ? { csvImport } : {}),
       ...(csvSourcePath === undefined ? {} : { csvSourcePath }),
@@ -4679,10 +4732,10 @@ async function openWorkbookSession(
       // recovery copy that is the original file, not the copy under userData.
       path: restoreTarget ?? path,
       sha256: digest,
-      fileBytes: snapshotStat.size,
+      fileBytes: sourceBytes.byteLength,
       readOnly: false,
       needsSaveAs: suggestSaveAs !== undefined,
-      passwordProtected: password !== undefined,
+      passwordProtected: encrypted,
       ...(unsavedNew ? { unsavedNew: true } : {}),
       ...(csvSourcePath === undefined ? {} : { csvPath: csvSourcePath }),
       ...(emptyCsv ? { emptyCsv: true } : {}),

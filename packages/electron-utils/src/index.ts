@@ -123,7 +123,7 @@ export {
   type RendererHost,
 } from './renderer-scheme'
 export { installRendererProtocol, registerRendererScheme } from './renderer-protocol'
-export { atomicCopyFile, atomicWriteFile, writeJsonAtomic } from './atomic-write'
+export { atomicCopyFile, atomicWriteFile, atomicWriteVia, writeJsonAtomic } from './atomic-write'
 export {
   PRINT_READY_SCRIPT,
   printHtmlDocument,

@@ -75,6 +75,7 @@ export {
 export {
   saveDocx,
   findChartWorkbookPath,
+  missingHeadingLevels,
   readDocxPartBase64,
   type SaveBlock,
   type SaveOptions,
@@ -194,6 +195,7 @@ export {
   type WatermarkSpec,
 } from './watermark'
 export {
+  builtInHeadingStyleUpsert,
   mergeStyleXml,
   mergeDefaultFontsXml,
   type DefaultFonts,
@@ -251,6 +253,20 @@ export {
   type RevisionXmlResult,
   type RevisionXmlType,
 } from './revision-xml'
+export {
+  resolveParagraphProps,
+  resolveCtxOf,
+  resolveParagraphPropsXml,
+  resolveRunProps,
+  shadowCompare,
+  type EffectivePPr,
+  type EffectiveRPr,
+  type PropSource,
+  type ResolveCompat,
+  type ResolveCtx,
+  type ResolveDiff,
+  type TableCond,
+} from './resolve-props'
 export {
   compareBlocks,
   compareDocuments,

@@ -3310,6 +3310,7 @@ function Ribbon({
         <RibbonGroup label={t('appGroupNotes')}>
           {largeMenu(t('appGroupNotes'), '🗒', t('appNotesDetail'), [
             { value: 'note-open', label: t('appNewNote') },
+            { value: 'note-insert-picture', label: t('appNoteInsertPicture') },
             { value: 'note-show-toggle', label: t('appShowHideNote') },
             { value: 'note-show-all', label: t('appShowAllNotes') },
             { value: 'notes-convert', label: t('appConvertToNotes') },

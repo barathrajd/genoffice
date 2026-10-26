@@ -5141,7 +5141,7 @@ export function App({
         if (!(await commitActiveEditor())) return t('appSaveFailed')
         const beforeSave = lazyWorkbookRef.current
         if (!beforeSave?.file.passwordProtected) {
-          return 'This workbook is not protected by an open password.'
+          return t('appWorkbookNotPasswordProtected')
         }
 
         // Commit all current sheet edits before changing the package password.
@@ -5154,7 +5154,7 @@ export function App({
           return saved.error ?? t('appSaveFailed')
         }
         if (!current.file.passwordProtected) {
-          return 'This workbook is not protected by an open password.'
+          return t('appWorkbookNotPasswordProtected')
         }
 
         const result = await window.desktopApi.updateWorkbookPassword(

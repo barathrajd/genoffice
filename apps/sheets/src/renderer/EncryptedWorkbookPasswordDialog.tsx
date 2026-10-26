@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { useI18n } from './i18n/locale'
 import { useModalDialog } from './modal-dialog'
 
 export function EncryptedWorkbookPasswordDialog({
@@ -11,6 +12,7 @@ export function EncryptedWorkbookPasswordDialog({
   readonly onSubmit: (password: string) => void
   readonly onClose: () => void
 }): React.JSX.Element {
+  const { t } = useI18n()
   const [password, setPassword] = useState('')
   const modal = useModalDialog(onClose)
   const submit = (): void => {
@@ -27,13 +29,13 @@ export function EncryptedWorkbookPasswordDialog({
         {...modal}
         onClick={(event) => event.stopPropagation()}
       >
-        <header id="encrypted-workbook-password-title">Open password-protected workbook</header>
+        <header id="encrypted-workbook-password-title">{t('appEncryptedOpenTitle')}</header>
         <section className="dialog-body">
           <p className="encrypted-workbook-password-copy" id="encrypted-workbook-password-copy">
-            Enter the password to unlock this workbook.
+            {t('appEncryptedOpenCopy')}
           </p>
           <label>
-            Password
+            {t('appEncryptedPasswordLabel')}
             <input
               autoFocus
               autoComplete="current-password"
@@ -53,10 +55,10 @@ export function EncryptedWorkbookPasswordDialog({
         </section>
         <div className="dialog-actions">
           <button className="secondary" type="button" onClick={onClose}>
-            Cancel
+            {t('dlgCancel')}
           </button>
           <button className="primary-action" type="button" disabled={!password} onClick={submit}>
-            Open
+            {t('appEncryptedOpen')}
           </button>
         </div>
       </div>

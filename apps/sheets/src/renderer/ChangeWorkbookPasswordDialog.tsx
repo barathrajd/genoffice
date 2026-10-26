@@ -20,7 +20,7 @@ export function ChangeWorkbookPasswordDialog({
   const submit = async (): Promise<void> => {
     if (busy || !password || !confirmation) return
     if (password !== confirmation) {
-      setError('The passwords do not match.')
+      setError(t('appPasswordsMismatch'))
       return
     }
     setBusy(true)
@@ -30,7 +30,7 @@ export function ChangeWorkbookPasswordDialog({
       if (failure) setError(failure)
       else onClose()
     } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : 'Could not update the workbook password.')
+      setError(reason instanceof Error ? reason.message : t('appPasswordUpdateFailed'))
     } finally {
       setBusy(false)
     }
@@ -46,13 +46,13 @@ export function ChangeWorkbookPasswordDialog({
         {...modal}
         onClick={(event) => event.stopPropagation()}
       >
-        <header id="change-workbook-password-title">Change workbook password</header>
+        <header id="change-workbook-password-title">{t('appChangePasswordTitle')}</header>
         <section className="dialog-body">
           <p className="encrypted-workbook-password-copy" id="change-workbook-password-copy">
-            Choose a new password and confirm it below.
+            {t('appChangePasswordCopy')}
           </p>
           <label>
-            New password
+            {t('appNewPasswordLabel')}
             <input
               autoFocus
               autoComplete="new-password"
@@ -67,7 +67,7 @@ export function ChangeWorkbookPasswordDialog({
             />
           </label>
           <label>
-            Confirm new password
+            {t('appConfirmPasswordLabel')}
             <input
               autoComplete="new-password"
               maxLength={1024}
@@ -96,7 +96,7 @@ export function ChangeWorkbookPasswordDialog({
             disabled={busy || !password || !confirmation}
             onClick={() => void submit()}
           >
-            {busy ? 'Updating…' : 'Update Password'}
+            {busy ? t('appPasswordUpdating') : t('appUpdatePassword')}
           </button>
         </div>
       </div>

@@ -9,7 +9,17 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { refreshCsvDigest } from './csv-digest'
 import { createServer } from 'node:http'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -41,6 +51,7 @@ import {
   abortOnDestroyed,
   decryptOoxml,
   encryptOoxml,
+  isCfbFile,
   isEncryptedOoxml,
   appMenuLabels,
   appMenuTemplate,
@@ -4625,6 +4636,18 @@ async function getSessionSnapshotDirectory(): Promise<string> {
   return sessionSnapshotDirectoryPromise
 }
 
+/** Header sniff only: an encrypted workbook is a CFB container, a plain one a zip. */
+async function isCfbWorkbookFile(path: string): Promise<boolean> {
+  const handle = await open(path, 'r')
+  try {
+    const header = Buffer.alloc(8)
+    const { bytesRead } = await handle.read(header, 0, header.length, 0)
+    return isCfbFile(header.subarray(0, bytesRead))
+  } finally {
+    await handle.close()
+  }
+}
+
 /** Snapshot bytes in a private temporary directory; this is the session's
  * save base (see SessionInfo.snapshotPath). */
 async function snapshotWorkbook(path: string, bytes?: Buffer): Promise<string> {
@@ -4684,20 +4707,28 @@ async function openWorkbookSession(
     unsavedNew,
     password,
   } = options ?? {}
-  const sourceBytes = await readFile(path)
-  const encrypted = isEncryptedOoxml(sourceBytes)
-  if (encrypted && password === undefined) {
+  // Only a CFB container (the encrypted wrapper) is read into memory; a plain
+  // zip package keeps the streamed copy + file digest so large workbooks do
+  // not double their footprint at open.
+  const sourceBytes = (await isCfbWorkbookFile(path)) ? await readFile(path) : undefined
+  const encryptedBytes = sourceBytes && isEncryptedOoxml(sourceBytes) ? sourceBytes : undefined
+  const encrypted = encryptedBytes !== undefined
+  if (encryptedBytes && password === undefined) {
     throw new Error('This workbook is password-protected. PASSWORD_REQUIRED')
   }
-  const snapshotBytes = encrypted ? await decryptOoxml(sourceBytes, password!) : undefined
+  const snapshotBytes = encryptedBytes ? await decryptOoxml(encryptedBytes, password!) : undefined
   // Snapshot first, then the sidecar opens the snapshot (not the live path):
   // everything the session serves — cell reads, media, recalc, saves — comes
   // from the same bytes, even if the file on disk changes right after the
   // copy. The digest also describes exactly those bytes.
   const snapshotPath = await snapshotWorkbook(path, snapshotBytes)
   try {
-    const [rawOpened, restoreTargetSha, csvSourceSha] = await Promise.all([
+    const [rawOpened, digest, fileBytes, restoreTargetSha, csvSourceSha] = await Promise.all([
       client.open(snapshotPath, getUiLang(), systemShortDate()),
+      sourceBytes
+        ? createHash('sha256').update(sourceBytes).digest('hex')
+        : sha256File(snapshotPath),
+      sourceBytes ? sourceBytes.byteLength : stat(snapshotPath).then((s) => s.size),
       // Missing original (deleted since the crash) is fine: the write-back recreates it.
       restoreTarget === undefined
         ? Promise.resolve(undefined)
@@ -4707,7 +4738,6 @@ async function openWorkbookSession(
         : sha256File(csvSourcePath).catch(() => undefined),
     ])
     const opened = sidecarOpenResultSchema.parse(rawOpened)
-    const digest = createHash('sha256').update(sourceBytes).digest('hex')
     sessions.set(opened.sessionId, {
       path,
       snapshotPath,
@@ -4732,7 +4762,7 @@ async function openWorkbookSession(
       // recovery copy that is the original file, not the copy under userData.
       path: restoreTarget ?? path,
       sha256: digest,
-      fileBytes: sourceBytes.byteLength,
+      fileBytes,
       readOnly: false,
       needsSaveAs: suggestSaveAs !== undefined,
       passwordProtected: encrypted,
